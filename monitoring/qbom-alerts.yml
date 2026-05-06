@@ -1,0 +1,100 @@
+# monitoring/qbom-alerts.yml
+# Prometheus alerting rules for Q-BOM AI.
+# Copy to /etc/prometheus/rules/ on your Prometheus instance.
+
+groups:
+  - name: qbom.availability
+    rules:
+      - alert: QBOMBackendDown
+        expr: up{job="qbom-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: qbom
+        annotations:
+          summary: "Q-BOM backend is down"
+          description: "Backend pod {{ $labels.pod }} has been unreachable for 2+ minutes."
+
+      - alert: QBOMHighErrorRate
+        expr: |
+          rate(http_requests_total{job="qbom-backend",status=~"5.."}[5m])
+          / rate(http_requests_total{job="qbom-backend"}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Q-BOM error rate > 5%"
+          description: "HTTP 5xx rate is {{ $value | humanizePercentage }} over last 5m."
+
+  - name: qbom.performance
+    rules:
+      - alert: QBOMScanLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            rate(http_request_duration_seconds_bucket{
+              job="qbom-backend",
+              path="/api/scan"
+            }[5m])
+          ) > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Q-BOM scan P95 latency > 30s"
+          description: "95th percentile scan submission latency is {{ $value }}s."
+
+      - alert: QBOMStalledScans
+        expr: |
+          increase(qbom_scans_stalled_total[1h]) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} scans stalled in last hour"
+          description: "Scans are timing out — check Azure OpenAI connectivity."
+
+  - name: qbom.resources
+    rules:
+      - alert: QBOMPodCPUHigh
+        expr: |
+          rate(container_cpu_usage_seconds_total{
+            namespace="qbom",
+            container="qbom-backend"
+          }[5m]) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Q-BOM backend CPU > 90%"
+          description: "Pod {{ $labels.pod }} CPU at {{ $value | humanizePercentage }}."
+
+      - alert: QBOMPodMemoryHigh
+        expr: |
+          container_memory_working_set_bytes{namespace="qbom",container="qbom-backend"}
+          / container_spec_memory_limit_bytes{namespace="qbom",container="qbom-backend"}
+          > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Q-BOM backend memory > 85% of limit"
+
+  - name: qbom.evaluation
+    rules:
+      - alert: QBOMEvalFaithfulnessLow
+        expr: qbom_eval_faithfulness_score < 0.75
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DeepEval faithfulness score dropped below 0.75"
+          description: "Score: {{ $value }}. Migration guidance may not be grounded in retrieved docs."
+
+      - alert: QBOMEvalRelevancyLow
+        expr: qbom_eval_answer_relevancy_score < 0.70
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Answer relevancy dropped below 0.70"
+          description: "Score: {{ $value }}. Check retrieval pipeline and knowledge base freshness."

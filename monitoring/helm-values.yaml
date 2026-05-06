@@ -1,0 +1,112 @@
+# monitoring/helm-values.yaml
+# Helm values for kube-prometheus-stack targeting Q-BOM AI on AKS.
+#
+# Install:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm repo update
+#   helm install kube-prom prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring --create-namespace \
+#     --values monitoring/helm-values.yaml
+
+grafana:
+  enabled: true
+  adminPassword: "CHANGE_ME_IN_PROD"
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: azure/application-gateway
+    hosts:
+      - grafana.qbom.ai
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.qbom.ai
+  # Auto-provision Q-BOM dashboard
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: qbom
+          orgId: 1
+          folder: "Q-BOM AI"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/qbom
+  dashboardsConfigMaps:
+    qbom: "qbom-grafana-dashboards"
+
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    retentionSize: "10GB"
+    # Scrape Q-BOM pods via pod annotations
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    additionalScrapeConfigs:
+      - job_name: qbom-backend
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [qbom]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: '([^:]+)(?::\d+)?;(\d+)'
+            replacement: '$1:$2'
+            target_label: __address__
+    # Load Q-BOM alert rules
+    ruleSelector:
+      matchLabels:
+        app: qbom-ai
+    # Storage for metric history
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: managed-premium
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi
+
+alertmanager:
+  enabled: true
+  config:
+    global:
+      slack_api_url: "REPLACE_WITH_SLACK_WEBHOOK"
+    route:
+      group_by: ["alertname", "cluster"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: "qbom-slack"
+      routes:
+        - match:
+            severity: critical
+          receiver: "qbom-pagerduty"
+        - match:
+            severity: warning
+          receiver: "qbom-slack"
+    receivers:
+      - name: "qbom-slack"
+        slack_configs:
+          - channel: "#qbom-alerts"
+            title: "{{ .GroupLabels.alertname }}"
+            text: "{{ range .Alerts }}{{ .Annotations.description }}{{ end }}"
+            send_resolved: true
+      - name: "qbom-pagerduty"
+        pagerduty_configs:
+          - service_key: "REPLACE_WITH_PAGERDUTY_KEY"
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true

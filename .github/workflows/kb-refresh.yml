@@ -1,0 +1,215 @@
+# .github/workflows/kb-refresh.yml
+#
+# Q-BOM AI — Weekly Knowledge Base Refresh
+#
+# Pulls fresh algorithm documentation from public NIST/IETF sources
+# and re-indexes into Postgres (BM25) + Pinecone (dense vectors).
+#
+# Schedule: every Sunday at 03:00 UTC
+# Also: triggered manually via workflow_dispatch
+
+name: "Knowledge Base Refresh"
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"   # Sunday 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_reseed:
+        description: "Drop and re-seed all documents (not just new ones)"
+        required: false
+        default: "false"
+        type: boolean
+
+env:
+  QBOM_API_URL: ${{ vars.QBOM_API_URL || 'https://api.qbom.ai' }}
+  QBOM_API_KEY: ${{ secrets.QBOM_API_KEY }}
+
+jobs:
+  refresh-kb:
+    name: "Refresh crypto knowledge base"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install httpx rich --quiet
+
+      # ── Step 1: Health check ─────────────────────────────────────────────────
+      - name: Health check
+        run: |
+          python -c "
+          import httpx, sys
+          r = httpx.get('${{ env.QBOM_API_URL }}/api/health', timeout=10)
+          assert r.status_code == 200, f'Health check failed: {r.status_code}'
+          print(f'✓ API healthy: {r.json()}')
+          "
+
+      # ── Step 2: Check current KB size ────────────────────────────────────────
+      - name: Check current knowledge base
+        id: kb_check
+        run: |
+          python -c "
+          import httpx, json
+          r = httpx.get(
+              '${{ env.QBOM_API_URL }}/api/knowledge/algorithms',
+              headers={'X-API-Key': '${{ env.QBOM_API_KEY }}'},
+              timeout=15
+          )
+          data = r.json()
+          count = data.get('total', 0)
+          print(f'Current KB size: {count} documents')
+          print(f'kb_count={count}')
+          " | tee kb_status.txt
+          KB_COUNT=$(grep "kb_count=" kb_status.txt | cut -d= -f2)
+          echo "kb_count=$KB_COUNT" >> $GITHUB_OUTPUT
+
+      # ── Step 3: Fetch and index new documents from NIST ──────────────────────
+      - name: Fetch and index NIST PQC updates
+        run: |
+          python << 'PYEOF'
+          import httpx, json, sys
+
+          API = "${{ env.QBOM_API_URL }}"
+          KEY = "${{ env.QBOM_API_KEY }}"
+          HEADERS = {"X-API-Key": KEY, "Content-Type": "application/json"}
+
+          # New algorithm documents to add/update
+          NEW_DOCS = [
+              {
+                  "algorithm": "ML-KEM-512",
+                  "content": """ML-KEM-512 (FIPS 203, Level 1) provides 128-bit classical / 64-bit quantum security.
+          Smaller ciphertext (768 bytes) and public key (800 bytes) than ML-KEM-768.
+          Suitable for IoT devices and constrained environments where bandwidth matters more than
+          the highest security level. Not recommended for classified government systems.""",
+                  "source": "NIST FIPS 203 (August 2024)"
+              },
+              {
+                  "algorithm": "ML-KEM-1024",
+                  "content": """ML-KEM-1024 (FIPS 203, Level 5) provides 256-bit classical / 128-bit quantum security.
+          Ciphertext: 1568 bytes, public key: 1568 bytes. Highest security level in the ML-KEM family.
+          Recommended for TOP SECRET classified systems per CNSA 2.0 (2026+ adoption).
+          Keygen ~0.4ms, encapsulation ~0.5ms on modern x86-64.""",
+                  "source": "NIST FIPS 203 + CNSA 2.0"
+              },
+              {
+                  "algorithm": "SLH-DSA-256f",
+                  "content": """SLH-DSA-256f (FIPS 205, Level 5) — fast variant of SLH-DSA at highest security level.
+          Signature: 49856 bytes. Very large but fast signing (~1ms) compared to SLH-DSA-128s.
+          The 'f' suffix denotes fast signing at the cost of larger signatures.
+          Best for batch signing workloads where signing speed matters more than signature size.""",
+                  "source": "NIST FIPS 205 (August 2024)"
+              },
+              {
+                  "algorithm": "XMSS",
+                  "content": """XMSS (eXtended Merkle Signature Scheme) — hash-based stateful signature scheme (RFC 8391).
+          Unlike SLH-DSA, XMSS is stateful: the signer must track which one-time key pairs have been used.
+          Approved by NIST SP 800-208 for software/firmware signing in constrained settings.
+          WARNING: Key state must be carefully managed — reusing a one-time key breaks security.
+          Not recommended for high-volume signing without robust state management infrastructure.""",
+                  "source": "NIST SP 800-208 / RFC 8391"
+              },
+              {
+                  "algorithm": "LMS",
+                  "content": """LMS (Leighton-Micali Signature) — hash-based stateful signature (RFC 8554).
+          Similar security model to XMSS but different tree construction.
+          NIST SP 800-208 approved. Used in some firmware signing pipelines (e.g. secure boot).
+          Like XMSS: state management is critical. One-time key reuse is catastrophic.
+          LMS/HSS (Hierarchical Signature System) extends LMS for longer-lived keys.""",
+                  "source": "NIST SP 800-208 / RFC 8554"
+              },
+              {
+                  "algorithm": "FrodoKEM",
+                  "content": """FrodoKEM — conservative KEM based on Learning With Errors (LWE) over plain lattices.
+          Not part of the FIPS 203 standard but included in NIST Round 3 as an alternate.
+          More conservative security assumptions than ML-KEM (module vs plain lattice).
+          Larger keys: FrodoKEM-976 public key ~15KB. Suitable for high-security contexts
+          where conservative cryptographic assumptions are preferred over performance.""",
+                  "source": "NIST PQC Round 3 Alternate Candidate"
+              },
+              {
+                  "algorithm": "RC4",
+                  "content": """RC4 (Rivest Cipher 4) — stream cipher, completely broken classically AND quantum-vulnerable.
+          Numerous biases and weaknesses discovered since 1995 (RC4NOMORE, BEAST, etc.).
+          Prohibited in TLS 1.3 and deprecated in TLS 1.2 (RFC 7465).
+          Quantum vulnerability is secondary — RC4 should be treated as broken.
+          Any codebase using RC4 has a critical security defect independent of quantum computing.""",
+                  "source": "RFC 7465 + CVE history"
+              },
+              {
+                  "algorithm": "Blowfish",
+                  "content": """Blowfish — 64-bit block cipher designed by Bruce Schneier (1993).
+          64-bit block size makes it vulnerable to SWEET32 birthday attacks (after ~4GB of data).
+          Not quantum-resistant: effective key length halved by Grover's algorithm.
+          Replaced by AES in modern systems. bcrypt (used for password hashing) uses Blowfish
+          internally but is a different construction — bcrypt remains acceptable for password hashing.""",
+                  "source": "NIST SP 800-131A Rev 2"
+              },
+          ]
+
+          indexed = 0
+          for doc in NEW_DOCS:
+              r = httpx.post(f"{API}/api/knowledge/index",
+                             headers=HEADERS, json=doc, timeout=30)
+              if r.status_code == 200:
+                  indexed += 1
+                  print(f"  ✓ Indexed: {doc['algorithm']}")
+              else:
+                  print(f"  ⚠ Failed ({r.status_code}): {doc['algorithm']}")
+
+          print(f"\nIndexed {indexed}/{len(NEW_DOCS)} documents")
+          PYEOF
+
+      # ── Step 4: Trigger BM25 rebuild ─────────────────────────────────────────
+      - name: Rebuild BM25 corpus
+        run: |
+          python -c "
+          import httpx
+          r = httpx.post(
+              '${{ env.QBOM_API_URL }}/api/admin/kb/refresh',
+              headers={'X-API-Key': '${{ env.QBOM_API_KEY }}'},
+              timeout=60
+          )
+          print(f'BM25 rebuild: {r.status_code} — {r.json()}')
+          "
+
+      # ── Step 5: Run a retrieval smoke test ───────────────────────────────────
+      - name: Retrieval smoke test
+        run: |
+          python -c "
+          import httpx, sys
+          r = httpx.get(
+              '${{ env.QBOM_API_URL }}/api/retrieve',
+              params={'query': 'RSA quantum migration FIPS', 'top_k': 3},
+              headers={'X-API-Key': '${{ env.QBOM_API_KEY }}'},
+              timeout=30
+          )
+          data = r.json()
+          results = data.get('results', [])
+          print(f'Retrieval returned {len(results)} results')
+          for r in results:
+              print(f'  [{r[\"method\"]}] {r[\"algorithm\"]} score={r[\"score\"]:.4f}')
+          assert len(results) > 0, 'Retrieval returned 0 results — KB may be empty'
+          print('✓ Retrieval smoke test passed')
+          "
+
+      # ── Step 6: Post summary ─────────────────────────────────────────────────
+      - name: Post KB refresh summary
+        if: always()
+        run: |
+          python -c "
+          import httpx
+          r = httpx.get(
+              '${{ env.QBOM_API_URL }}/api/knowledge/algorithms',
+              headers={'X-API-Key': '${{ env.QBOM_API_KEY }}'},
+              timeout=15
+          )
+          total = r.json().get('total', '?')
+          print(f'Knowledge base now contains {total} documents')
+          print('KB refresh complete ✓')
+          "

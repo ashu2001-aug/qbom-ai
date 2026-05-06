@@ -1,0 +1,334 @@
+# .github/workflows/ci-cd.yml
+#
+# Q-BOM AI — Full CI/CD Pipeline
+#
+# Stages:
+#   1. test      — Python unit + integration tests, frontend vitest
+#   2. build     — Docker image build + push to Azure Container Registry
+#   3. deploy    — Kubectl apply to AKS (staging on PR, production on main)
+#   4. smoke     — Post-deploy health check + seed knowledge base
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  ACR_NAME:          ${{ vars.ACR_NAME || 'qbomai' }}
+  AKS_CLUSTER:       ${{ vars.AKS_CLUSTER || 'qbom-aks' }}
+  AKS_RESOURCE_GROUP:${{ vars.AKS_RESOURCE_GROUP || 'qbom-rg' }}
+  IMAGE_TAG:         ${{ github.sha }}
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  # JOB 1 — Python tests
+  # ════════════════════════════════════════════════════════════
+  test-backend:
+    name: "Backend tests"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: qbom_test
+          POSTGRES_USER: qbom
+          POSTGRES_PASSWORD: test_password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL:          postgresql+asyncpg://qbom:test_password@localhost:5432/qbom_test
+      AZURE_OPENAI_API_KEY:  test-key
+      AZURE_OPENAI_ENDPOINT: https://test.openai.azure.com/
+      LANGCHAIN_TRACING_V2:  "false"
+      PINECONE_API_KEY:      test-key
+      ENVIRONMENT:           test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt pytest pytest-asyncio pytest-cov anyio httpx --quiet
+
+      - name: Run unit tests
+        working-directory: backend
+        run: |
+          python -m pytest ../tests/unit/ -v \
+            --cov=. --cov-report=xml --cov-report=term-missing \
+            --tb=short
+
+      - name: Run integration tests
+        working-directory: backend
+        run: |
+          python -m pytest ../tests/integration/ -v \
+            --tb=short --asyncio-mode=auto
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend/coverage.xml
+          flags: backend
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 2 — Frontend tests
+  # ════════════════════════════════════════════════════════════
+  test-frontend:
+    name: "Frontend tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        working-directory: frontend
+        run: npm test -- --run --reporter=verbose
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+        env:
+          VITE_API_URL: https://api.qbom.ai
+          VITE_API_KEY:  qbom-pro-key-2025
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 3 — Security scan (Trivy + Bandit)
+  # ════════════════════════════════════════════════════════════
+  security:
+    name: "Security scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python static analysis (Bandit)
+        run: |
+          pip install bandit --quiet
+          bandit -r backend/ -ll --exclude backend/tests -f json -o bandit-report.json || true
+          cat bandit-report.json | python -c "
+          import sys, json
+          r = json.load(sys.stdin)
+          high = [i for i in r.get('results',[]) if i['issue_severity']=='HIGH']
+          if high:
+              print(f'⚠ {len(high)} HIGH severity Bandit issues found')
+              for i in high[:5]: print(f'  {i[\"filename\"]}:{i[\"line_number\"]} — {i[\"issue_text\"]}')
+          else:
+              print('✓ No HIGH severity Bandit issues')
+          " || true
+
+      - name: Dependency audit (pip-audit)
+        run: |
+          pip install pip-audit --quiet
+          pip-audit -r backend/requirements.txt --format=json -o pip-audit.json || true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            pip-audit.json
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 4 — Docker build + push to ACR
+  # ════════════════════════════════════════════════════════════
+  build:
+    name: "Docker build"
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend]
+    if: github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: ACR login
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ACR_NAME }}.azurecr.io/qbom-backend
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.ACR_NAME }}.azurecr.io/qbom-backend:buildcache
+          cache-to:   type=registry,ref=${{ env.ACR_NAME }}.azurecr.io/qbom-backend:buildcache,mode=max
+
+      - name: Build and push frontend (nginx)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.prod
+          push: true
+          tags: ${{ env.ACR_NAME }}.azurecr.io/qbom-frontend:${{ env.IMAGE_TAG }}
+          cache-from: type=registry,ref=${{ env.ACR_NAME }}.azurecr.io/qbom-frontend:buildcache
+          cache-to:   type=registry,ref=${{ env.ACR_NAME }}.azurecr.io/qbom-frontend:buildcache,mode=max
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 5 — Deploy to AKS staging (PRs)
+  # ════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: "Deploy → staging"
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.qbom.ai
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER }} \
+            --overwrite-existing
+
+      - name: Deploy to staging namespace
+        run: |
+          kubectl apply -f k8s-deployment.yaml -n qbom-staging
+          kubectl set image deployment/qbom-backend \
+            qbom-backend=${{ env.ACR_NAME }}.azurecr.io/qbom-backend:sha-${{ env.IMAGE_TAG }} \
+            -n qbom-staging
+          kubectl rollout status deployment/qbom-backend -n qbom-staging --timeout=300s
+
+      - name: Run smoke tests (staging)
+        run: |
+          STAGING_URL="https://staging.qbom.ai"
+          curl -sf "$STAGING_URL/api/health" | python -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d['status'] == 'ok', f'Health check failed: {d}'
+          print('✓ Staging health check passed')
+          "
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 6 — Deploy to AKS production (main only)
+  # ════════════════════════════════════════════════════════════
+  deploy-production:
+    name: "Deploy → production"
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://api.qbom.ai
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER }} \
+            --overwrite-existing
+
+      - name: Rolling deploy to production
+        run: |
+          # Patch image tag in deployment
+          kubectl set image deployment/qbom-backend \
+            qbom-backend=${{ env.ACR_NAME }}.azurecr.io/qbom-backend:sha-${{ env.IMAGE_TAG }} \
+            -n qbom
+
+          kubectl set image deployment/qbom-mcp \
+            qbom-mcp=${{ env.ACR_NAME }}.azurecr.io/qbom-backend:sha-${{ env.IMAGE_TAG }} \
+            -n qbom
+
+          # Wait for rollout (AKS does rolling update, zero downtime)
+          kubectl rollout status deployment/qbom-backend -n qbom --timeout=300s
+          kubectl rollout status deployment/qbom-mcp     -n qbom --timeout=180s
+
+      - name: Smoke test production
+        run: |
+          sleep 10
+          PROD_URL="https://api.qbom.ai"
+          python -c "
+          import httpx
+          r = httpx.get('$PROD_URL/api/health', timeout=15)
+          assert r.status_code == 200
+          assert r.json()['status'] == 'ok'
+          print(f'✓ Production health OK: {r.json()}')
+          "
+
+      - name: Seed knowledge base (first deploy only)
+        run: |
+          python -c "
+          import httpx
+          r = httpx.post(
+              'https://api.qbom.ai/api/knowledge/seed',
+              headers={'X-API-Key': '${{ secrets.QBOM_API_KEY }}'},
+              timeout=60
+          )
+          print(r.json())
+          " || echo "Seed already complete or skipped"
+
+      - name: Notify deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.sha }}',
+              state: 'success',
+              description: 'Deployed to production',
+              context: 'deployment/production',
+              target_url: 'https://qbom.ai'
+            })

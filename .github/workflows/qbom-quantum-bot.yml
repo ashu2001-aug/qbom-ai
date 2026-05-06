@@ -1,0 +1,325 @@
+# .github/workflows/qbom-quantum-bot.yml
+#
+# Q-BOM AI — Quantum Vulnerability Bot
+#
+# Triggers:
+#   - Every push to main/master
+#   - Every pull request
+#   - Weekly schedule (Monday 02:00 UTC)
+#   - Manual dispatch
+#
+# What it does:
+#   1. Scans the repository for quantum-vulnerable cryptographic primitives
+#   2. Downloads the CycloneDX v1.7 CBOM as a build artifact
+#   3. On PRs: posts a detailed comment with findings and migration guidance
+#   4. On main pushes: creates/updates a GitHub Issue tracking quantum debt
+#   5. Fails the workflow if HNDL score >= 8.0 (configurable)
+
+name: "Q-BOM AI — Quantum Vulnerability Scan"
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "0 2 * * 1"   # Weekly Monday 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      sensitivity:
+        description: "Data sensitivity level"
+        required: false
+        default: "medium"
+        type: choice
+        options: [low, medium, high, medical, financial, critical]
+      fail_threshold:
+        description: "HNDL score threshold to fail build"
+        required: false
+        default: "8.0"
+
+env:
+  QBOM_API_URL: ${{ vars.QBOM_API_URL || 'https://api.qbom.ai' }}
+  QBOM_API_KEY: ${{ secrets.QBOM_API_KEY || 'qbom-demo-key-2025' }}
+  SENSITIVITY: ${{ inputs.sensitivity || 'medium' }}
+  FAIL_THRESHOLD: ${{ inputs.fail_threshold || '8.0' }}
+
+jobs:
+  quantum-scan:
+    name: "Quantum Cryptography Audit"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Q-BOM CLI
+        run: pip install httpx rich click --quiet
+
+      # ── Step 1: Submit scan ──────────────────────────────────────────────────
+      - name: Submit quantum vulnerability scan
+        id: submit
+        run: |
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          echo "Scanning: $REPO_URL"
+
+          RESPONSE=$(python -c "
+          import httpx, json, sys
+          r = httpx.post(
+              '${{ env.QBOM_API_URL }}/api/scan',
+              headers={'X-API-Key': '${{ env.QBOM_API_KEY }}'},
+              json={'target': '$REPO_URL', 'target_type': 'repo', 'data_sensitivity': '${{ env.SENSITIVITY }}'},
+              timeout=30
+          )
+          print(r.text)
+          sys.exit(0 if r.status_code in (200, 202) else 1)
+          ")
+
+          echo "API response: $RESPONSE"
+          SCAN_ID=$(echo $RESPONSE | python -c "import sys,json; print(json.load(sys.stdin)['scan_id'])")
+          echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
+          echo "Scan ID: $SCAN_ID"
+
+      # ── Step 2: Poll until complete ──────────────────────────────────────────
+      - name: Wait for scan completion
+        id: poll
+        run: |
+          SCAN_ID="${{ steps.submit.outputs.scan_id }}"
+          echo "Polling scan $SCAN_ID…"
+
+          for i in $(seq 1 40); do
+            sleep 15
+            RESPONSE=$(python -c "
+          import httpx, json
+          r = httpx.get(
+              '${{ env.QBOM_API_URL }}/api/scan/$SCAN_ID',
+              headers={'X-API-Key': '${{ env.QBOM_API_KEY }}'},
+              timeout=10
+          )
+          print(r.text)
+            ")
+            STATUS=$(echo $RESPONSE | python -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','unknown'))")
+            echo "[$i/40] Status: $STATUS"
+
+            if [ "$STATUS" = "complete" ]; then
+              HNDL=$(echo $RESPONSE | python -c "import sys,json; print(json.load(sys.stdin).get('hndl_score',0))")
+              RISK=$(echo $RESPONSE | python -c "import sys,json; print(json.load(sys.stdin).get('risk_level','unknown'))")
+              COUNT=$(echo $RESPONSE | python -c "import sys,json; print(json.load(sys.stdin).get('finding_count',0))")
+              echo "hndl_score=$HNDL" >> $GITHUB_OUTPUT
+              echo "risk_level=$RISK" >> $GITHUB_OUTPUT
+              echo "finding_count=$COUNT" >> $GITHUB_OUTPUT
+              echo "status=complete" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            if [ "$STATUS" = "failed" ]; then
+              echo "status=failed" >> $GITHUB_OUTPUT
+              echo "Scan failed!"
+              exit 1
+            fi
+          done
+
+          if [ -z "${{ steps.poll.outputs.status }}" ]; then
+            echo "Scan timed out after 10 minutes"
+            exit 1
+          fi
+
+      # ── Step 3: Download BOM and report ─────────────────────────────────────
+      - name: Download CycloneDX BOM
+        run: |
+          SCAN_ID="${{ steps.submit.outputs.scan_id }}"
+          python -c "
+          import httpx, json
+          r = httpx.get(
+              '${{ env.QBOM_API_URL }}/api/scan/$SCAN_ID/bom',
+              headers={'X-API-Key': '${{ env.QBOM_API_KEY }}'},
+              timeout=30
+          )
+          with open('qbom-report.cdx.json', 'w') as f:
+              json.dump(r.json(), f, indent=2)
+          print(f'BOM written: {len(r.content)} bytes')
+          "
+
+      - name: Download findings
+        run: |
+          SCAN_ID="${{ steps.submit.outputs.scan_id }}"
+          python -c "
+          import httpx, json
+          r = httpx.get(
+              '${{ env.QBOM_API_URL }}/api/scan/$SCAN_ID/findings',
+              headers={'X-API-Key': '${{ env.QBOM_API_KEY }}'},
+              timeout=30
+          )
+          data = r.json()
+          with open('qbom-findings.json', 'w') as f:
+              json.dump(data, f, indent=2)
+          print(f'Findings: {len(data.get(\"findings\", []))} items')
+          "
+
+      # ── Step 4: Upload artifacts ─────────────────────────────────────────────
+      - name: Upload Q-BOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qbom-scan-${{ github.run_number }}
+          path: |
+            qbom-report.cdx.json
+            qbom-findings.json
+          retention-days: 90
+
+      # ── Step 5: PR comment ───────────────────────────────────────────────────
+      - name: Comment on Pull Request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const findings = JSON.parse(fs.readFileSync('qbom-findings.json', 'utf8'));
+            const hndl = '${{ steps.poll.outputs.hndl_score }}';
+            const risk = '${{ steps.poll.outputs.risk_level }}';
+            const count = '${{ steps.poll.outputs.finding_count }}';
+            const scanId = '${{ steps.submit.outputs.scan_id }}';
+
+            const vulnFindings = (findings.findings || []).filter(f => f.quantum_vulnerable);
+            const shadowFindings = (findings.findings || []).filter(f => f.is_shadow_crypto);
+
+            const riskEmoji = {'critical':'🔴','high':'🟠','medium':'🟡','low':'🟢'}[risk] || '❓';
+            const hndlNum = parseFloat(hndl);
+
+            let tableRows = '';
+            const criticals = vulnFindings.sort((a,b) => (b.hndl_score||0)-(a.hndl_score||0)).slice(0,8);
+            for (const f of criticals) {
+              const score = (f.hndl_score||0).toFixed(1);
+              const scoreEmoji = score >= 8 ? '🔴' : score >= 6 ? '🟠' : '🟡';
+              tableRows += `| ${scoreEmoji} \`${f.algorithm}\` | \`${(f.location||'').slice(0,50)}\` | ${score} | ${f.migration_path||'—'} |\n`;
+            }
+
+            const body = `## ${riskEmoji} Q-BOM AI — Quantum Vulnerability Report
+
+            > **Scan ID:** \`${scanId.slice(0,8)}\`
+
+            | Metric | Value |
+            |--------|-------|
+            | Risk Level | ${riskEmoji} **${risk.toUpperCase()}** |
+            | HNDL Score | **${hndlNum.toFixed(1)} / 10** |
+            | Total Findings | ${count} |
+            | Quantum-Vulnerable | ${vulnFindings.length} |
+            | Shadow Crypto | ${shadowFindings.length} |
+
+            ${tableRows ? `### Top Quantum-Vulnerable Algorithms\n\n| Algorithm | Location | HNDL | Migration |\n|-----------|----------|------|----------|\n${tableRows}` : '### ✅ No quantum-vulnerable algorithms detected'}
+
+            ${hndlNum >= 8 ? '> ⚠️ **Build will fail** — HNDL score exceeds threshold (8.0). Remediate critical findings before merging.' : ''}
+
+            <details><summary>📋 CycloneDX v1.7 BOM available in workflow artifacts</summary>
+
+            Download the full CBOM from the [Actions artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+            </details>
+
+            ---
+            *[Q-BOM AI](https://qbom.ai) — Autonomous Quantum Cryptography Auditor*`;
+
+            // Find existing Q-BOM comment and update, or create new
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.data.find(c => c.body.includes('Q-BOM AI — Quantum Vulnerability Report'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # ── Step 6: Create/update quantum debt issue (main only) ─────────────────
+      - name: Track quantum debt as GitHub Issue
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const findings = JSON.parse(fs.readFileSync('qbom-findings.json', 'utf8'));
+            const hndl = parseFloat('${{ steps.poll.outputs.hndl_score }}');
+            const risk = '${{ steps.poll.outputs.risk_level }}';
+
+            const vulnAlgos = [...new Set(
+              (findings.findings || [])
+                .filter(f => f.quantum_vulnerable)
+                .map(f => f.algorithm)
+            )];
+
+            const title = `[Q-BOM] Quantum crypto debt — ${risk.toUpperCase()} risk (HNDL: ${hndl.toFixed(1)})`;
+            const body = `## Quantum Cryptography Debt Tracker
+
+            Auto-generated by Q-BOM AI on ${new Date().toISOString().split('T')[0]}.
+
+            **Risk:** ${risk.toUpperCase()} | **HNDL Score:** ${hndl.toFixed(1)}/10
+
+            ### Vulnerable Algorithms Found
+            ${vulnAlgos.map(a => `- [ ] Migrate \`${a}\``).join('\n')}
+
+            ### Migration Resources
+            - [NIST PQC Standards](https://csrc.nist.gov/projects/post-quantum-cryptography)
+            - [CNSA 2.0 Timeline](https://media.defense.gov/2022/Sep/07/2003071834/-1/-1/0/CSA_CNSA_2.0_ALGORITHMS_.PDF)
+            - [Q-BOM Dashboard](https://qbom.ai/scan/${{ steps.submit.outputs.scan_id }})
+
+            ---
+            *Updated automatically on every push to main.*`;
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'quantum-debt',
+              state: 'open',
+            });
+
+            if (issues.data.length > 0) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues.data[0].number,
+                title, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title, body,
+                labels: ['quantum-debt', 'security'],
+              });
+            }
+
+      # ── Step 7: Fail if HNDL >= threshold ───────────────────────────────────
+      - name: Enforce HNDL threshold
+        run: |
+          HNDL="${{ steps.poll.outputs.hndl_score }}"
+          THRESHOLD="${{ env.FAIL_THRESHOLD }}"
+          echo "HNDL score: $HNDL | Threshold: $THRESHOLD"
+
+          python -c "
+          hndl = float('$HNDL' or '0')
+          threshold = float('$THRESHOLD' or '8.0')
+          if hndl >= threshold:
+              print(f'❌ HNDL score {hndl} exceeds threshold {threshold}. Remediate critical findings.')
+              exit(1)
+          else:
+              print(f'✅ HNDL score {hndl} is below threshold {threshold}.')
+          "

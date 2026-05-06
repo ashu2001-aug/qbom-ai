@@ -1,0 +1,53 @@
+# monitoring/prometheus.yml
+# Prometheus scrape configuration for Q-BOM AI on AKS.
+# Deploy alongside kube-prometheus-stack:
+#   helm install kube-prom prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring --values monitoring/helm-values.yaml
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    cluster: qbom-aks
+    environment: production
+
+scrape_configs:
+  # Q-BOM backend pods (auto-discovered via pod annotations)
+  - job_name: qbom-backend
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: [qbom]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+
+  # AKS node metrics
+  - job_name: kubernetes-nodes
+    kubernetes_sd_configs:
+      - role: node
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+
+rule_files:
+  - /etc/prometheus/rules/qbom-alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: [alertmanager:9093]

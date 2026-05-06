@@ -1,0 +1,60 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;600;700;800&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg:       #090b10;
+  --surface:  #0e1118;
+  --surface2: #151922;
+  --border:   rgba(255,255,255,0.07);
+  --border2:  rgba(255,255,255,0.12);
+  --text:     #e8eaf0;
+  --muted:    #6b7280;
+  --accent:   #00e5a0;
+  --accent2:  #0066ff;
+  --danger:   #ff4d6d;
+  --warn:     #f59e0b;
+  --info:     #38bdf8;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--surface); }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* Animations */
+@keyframes fadeIn  { from { opacity:0; transform:translateY(6px) } to { opacity:1; transform:none } }
+@keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:0.3} }
+@keyframes spin    { to { transform: rotate(360deg) } }
+@keyframes slideIn { from { opacity:0; transform:translateX(-8px) } to { opacity:1; transform:none } }
+
+.fade-in  { animation: fadeIn 0.25s ease; }
+.slide-in { animation: slideIn 0.2s ease; }
+
+/* WebSocket log scrollback */
+.log-container { max-height: 200px; overflow-y: auto; }
+
+/* Range input */
+input[type=range] {
+  -webkit-appearance: none;
+  width: 100%; height: 4px; border-radius: 2px;
+  background: var(--surface2); outline: none; cursor: pointer;
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); cursor: pointer;
+}

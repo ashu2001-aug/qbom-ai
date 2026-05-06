@@ -1,0 +1,133 @@
+version: "3.9"
+# Q-BOM AI Local Dev Stack
+# docker-compose up postgres backend
+# docker-compose --profile dev up        (+ Vite)
+# docker-compose --profile observability up  (+ OTel + Jaeger + Prometheus)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: qbom
+      POSTGRES_USER: qbom
+      POSTGRES_PASSWORD: qbom_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qbom"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://qbom:qbom_dev_password@postgres:5432/qbom
+      AZURE_OPENAI_ENDPOINT:    ${AZURE_OPENAI_ENDPOINT:-https://placeholder.openai.azure.com/}
+      AZURE_OPENAI_API_KEY:     ${AZURE_OPENAI_API_KEY:-placeholder}
+      AZURE_OPENAI_DEPLOYMENT:  ${AZURE_OPENAI_DEPLOYMENT:-gpt-4o}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-08-01-preview}
+      LANGCHAIN_TRACING_V2:     ${LANGCHAIN_TRACING_V2:-false}
+      LANGCHAIN_API_KEY:        ${LANGCHAIN_API_KEY:-placeholder}
+      LANGCHAIN_PROJECT:        qbom-ai-dev
+      PINECONE_API_KEY:         ${PINECONE_API_KEY:-placeholder}
+      PINECONE_INDEX:           qbom-crypto-index-dev
+      PINECONE_ENV:             ${PINECONE_ENV:-us-east-1}
+      ENVIRONMENT:              development
+      SCHEDULER_ENABLED:        "false"
+      SECRET_KEY:               dev-secret-do-not-use-in-production
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mcp:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python mcp/server.py
+    environment:
+      DATABASE_URL: postgresql+asyncpg://qbom:qbom_dev_password@postgres:5432/qbom
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - postgres
+
+  frontend-dev:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_URL: http://localhost:8000
+      VITE_API_KEY: qbom-demo-key-2025
+    profiles:
+      - dev
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_URL: http://localhost:8000
+        VITE_API_KEY: qbom-demo-key-2025
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    profiles:
+      - prod
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./monitoring/otel-collector.yaml:/etc/otel-collector.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8888:8888"
+    depends_on:
+      - jaeger
+    profiles:
+      - observability
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "14250:14250"
+    profiles:
+      - observability
+
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./monitoring/prometheus-local.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    profiles:
+      - observability
+
+volumes:
+  postgres_data:
+  prometheus_data:
