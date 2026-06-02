@@ -24,7 +24,6 @@ from typing import Annotated, TypedDict, Literal, Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_openai import AzureChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langsmith import traceable
@@ -35,15 +34,34 @@ from services.scanner import clone_and_scan, scan_website
 
 settings = get_settings()
 
-# ── Azure OpenAI LLM ──────────────────────────────────────────────────────────
-llm = AzureChatOpenAI(
-    azure_endpoint=settings.azure_openai_endpoint,
-    azure_deployment=settings.azure_openai_deployment,
-    api_version=settings.azure_openai_api_version,
-    api_key=settings.azure_openai_api_key,
-    temperature=0.1,
-    max_tokens=4096,
-)
+
+# ── LLM Factory — supports Gemini (local) and Azure OpenAI (production) ───────
+def _build_llm():
+    """
+    Constructs and returns the appropriate LLM client based on settings.
+    Supports ChatGoogleGenerativeAI (Gemini) for local testing and
+    AzureChatOpenAI for production workloads.
+    """
+    if settings.llm_provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=settings.gemini_model,
+            google_api_key=settings.google_api_key,
+            temperature=0.1,
+            max_output_tokens=4096,
+        )
+    else:
+        from langchain_openai import AzureChatOpenAI
+        return AzureChatOpenAI(
+            azure_endpoint=settings.azure_openai_endpoint,
+            azure_deployment=settings.azure_openai_deployment,
+            api_version=settings.azure_openai_api_version,
+            api_key=settings.azure_openai_api_key,
+            temperature=0.1,
+            max_tokens=4096,
+        )
+
+llm = _build_llm()
 
 # ── Shared Agent State ────────────────────────────────────────────────────────
 class QBOMState(TypedDict):
@@ -64,7 +82,15 @@ class QBOMState(TypedDict):
 # ── Tool definitions (callable by agents via tool-calling) ────────────────────
 @tool
 async def scan_target(target: str, target_type: str) -> str:
-    """Scan a GitHub repo or website URL for cryptographic primitives."""
+    """
+    Scan a GitHub repo or website URL for cryptographic primitives.
+    
+    This function delegates the scanning process to:
+    - clone_and_scan: for GitHub repositories ("repo")
+    - scan_website: for URLs/websites ("website")
+    
+    Returns the scan findings serialized as a JSON string.
+    """
     if target_type == "repo":
         findings = await clone_and_scan(target)
     else:
@@ -74,7 +100,13 @@ async def scan_target(target: str, target_type: str) -> str:
 
 @tool
 async def retrieve_crypto_knowledge(query: str) -> str:
-    """Hybrid BM25 + dense retrieval of cryptographic algorithm documentation."""
+    """
+    Hybrid BM25 + dense retrieval of cryptographic algorithm documentation.
+    
+    Uses hybrid_retrieve to search local/dense database for documentation on 
+    the given algorithm query, retrieving the top 3 documents, and returns 
+    them as a JSON string containing the algorithm name, content excerpt, and retrieval score.
+    """
     docs = await hybrid_retrieve(query, top_k=3)
     return json.dumps([
         {"algorithm": d.algorithm, "content": d.content[:500], "score": d.score}
@@ -87,6 +119,11 @@ def calculate_hndl_score(algorithm: str, data_sensitivity: str, exposure_years: 
     """
     Chain-of-Thought HNDL risk calculation.
     Returns 0-10 risk score for Harvest-Now-Decrypt-Later threat.
+    
+    Calculates the score based on:
+    - Base vulnerability of the algorithm (e.g. RSA is higher risk than AES-256).
+    - Sensitivity multiplier of the associated data (e.g. critical/financial vs public).
+    - Time-to-exposure factor relative to the estimated CRQC (Cryptanalytically Relevant Quantum Computer) timeline.
     """
     # Quantum vulnerability weight
     VULN_WEIGHTS = {
@@ -112,7 +149,14 @@ def calculate_hndl_score(algorithm: str, data_sensitivity: str, exposure_years: 
 
 @tool
 def get_migration_guidance(algorithm: str) -> str:
-    """Return NIST-recommended post-quantum migration path for an algorithm."""
+    """
+    Return NIST-recommended post-quantum migration path for an algorithm.
+    
+    Checks the specified algorithm name against a pre-defined mapping of classical
+    algorithms (such as RSA, ECC, AES-128, etc.) to their post-quantum alternatives
+    (like ML-KEM, ML-DSA, SLH-DSA, etc.), target implementation timelines, and required effort.
+    Returns the recommendation as a JSON-serialized dictionary.
+    """
     MIGRATIONS = {
         "RSA": {
             "replace_with": "ML-KEM-768 (FIPS 203)",
@@ -127,10 +171,10 @@ def get_migration_guidance(algorithm: str) -> str:
             "notes": "Drop-in for ECDSA in most TLS stacks"
         },
         "ECDSA": {
-            "replace_with": "SLH-DSA-128s (FIPS 205)",
-            "deadline": "2030",
+            "replace_with": "ML-DSA-65 (FIPS 204)",
+            "deadline": "2030 (CNSA 2.0)",
             "effort": "medium",
-            "notes": "Stateless; good for firmware signing"
+            "notes": "Drop-in replacement for ECDSA signatures in most application stacks"
         },
         "AES-128": {
             "replace_with": "AES-256",
@@ -162,6 +206,10 @@ async def supervisor_node(state: QBOMState) -> QBOMState:
     """
     Supervisor: reads current state and decides which specialist agent
     to invoke next. Uses Chain-of-Thought reasoning via system prompt.
+    
+    Reads progress from the QBOMState and generates the next_agent transition
+    ("scanner", "enricher", "reflector", "reporter", or "end") by asking
+    the LLM to analyze the current state summary.
     """
     system = SystemMessage(content="""You are the Q-BOM AI Supervisor. Your job is to orchestrate a 
 quantum cryptography audit pipeline. Based on the current state, decide the next step.
@@ -197,7 +245,13 @@ Current state:
 
 @traceable(name="scanner_agent")
 async def scanner_node(state: QBOMState) -> QBOMState:
-    """Invokes the scan tool and populates raw_findings."""
+    """
+    Invokes the scan tool and populates raw_findings.
+    
+    Runs a tool-calling LLM to invoke the `scan_target` tool. If a tool call is generated,
+    it executes `scan_target` using the state's target and target_type, parses the findings,
+    and updates the state with the raw findings list.
+    """
     system = SystemMessage(content="""You are the Scanner Agent. Your task is to scan the target 
 for ALL cryptographic primitives. Use the scan_target tool. Be thorough.""")
 
@@ -225,6 +279,10 @@ async def enricher_node(state: QBOMState) -> QBOMState:
     2. Calculate HNDL risk score
     3. Fetch migration guidance
     4. Detect shadow crypto via CoT reasoning
+    
+    Runs an agentic loop (up to 10 rounds) allowing the LLM to call tools
+    for background knowledge, risk scoring, and migration paths. Finally,
+    parses and extracts a structured JSON list of enriched findings.
     """
     system = SystemMessage(content="""You are the Cryptographic Enricher Agent. 
 For each finding, you MUST:
@@ -282,6 +340,9 @@ async def reflector_node(state: QBOMState) -> QBOMState:
     
     If quality < threshold, signals enricher to re-run.
     Max 2 reflection iterations to prevent infinite loops.
+    
+    Uses the LLM to analyze the enriched findings. If the LLM approves,
+    sets `reflection_passed` to True; otherwise, sets it to False to trigger a retry.
     """
     iterations = state.get("reflection_iterations", 0)
     if iterations >= 2:
@@ -319,6 +380,10 @@ async def reporter_node(state: QBOMState) -> QBOMState:
     """
     Reporter: generates the final CycloneDX v1.7 CBOM and computes
     aggregate risk metrics.
+    
+    Constructs a structured CycloneDX 1.7 JSON Bill of Materials containing
+    cryptographic asset details, locations, custom HNDL score properties, and migration paths.
+    Also calculates aggregate HNDL scores and overall risk level ("critical", "high", etc.).
     """
     findings = state["enriched_findings"]
 
@@ -341,7 +406,7 @@ async def reporter_node(state: QBOMState) -> QBOMState:
         "version": 1,
         "serialNumber": f"urn:uuid:{state['target'].replace('https://', '').replace('/', '-')}",
         "metadata": {
-            "timestamp": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
             "tools": [{"name": "Q-BOM AI", "version": "1.0.0"}],
             "component": {"type": "application", "name": state["target"]}
         },
@@ -390,6 +455,12 @@ async def reporter_node(state: QBOMState) -> QBOMState:
 
 # ── Edge routing logic ────────────────────────────────────────────────────────
 def route_from_supervisor(state: QBOMState) -> Literal["scanner", "enricher", "reflector", "reporter", END]:
+    """
+    Conditional router for the supervisor node.
+    
+    Reads the `next_agent` value determined by the supervisor and returns
+    the corresponding graph node or the END state symbol to terminate.
+    """
     next_a = state.get("next_agent", "scanner")
     if next_a == "end":
         return END
@@ -397,6 +468,13 @@ def route_from_supervisor(state: QBOMState) -> Literal["scanner", "enricher", "r
 
 
 def route_from_reflector(state: QBOMState) -> Literal["enricher", "reporter"]:
+    """
+    Conditional router for the reflector QA node.
+    
+    If self-reflection passed validation (`reflection_passed` is True),
+    routes to the "reporter" node to build the final BOM. Otherwise, routes
+    back to the "enricher" node to correct the findings.
+    """
     if state.get("reflection_passed"):
         return "reporter"
     return "enricher"  # Re-enrich if reflection failed
@@ -404,6 +482,13 @@ def route_from_reflector(state: QBOMState) -> Literal["enricher", "reporter"]:
 
 # ── Build the LangGraph ───────────────────────────────────────────────────────
 def build_qbom_graph() -> StateGraph:
+    """
+    Constructs, wires, and compiles the LangGraph state machine.
+    
+    Declares all nodes (supervisor, scanner, enricher, reflector, reporter),
+    defines the entry point, and configures the transitions and conditional router edges.
+    Returns the compiled graph.
+    """
     graph = StateGraph(QBOMState)
 
     graph.add_node("supervisor", supervisor_node)
@@ -431,6 +516,9 @@ async def run_scan(target: str, target_type: str = "repo") -> QBOMState:
     """
     Entry point to execute the full multi-agent scan pipeline.
     LangSmith will trace this run under the project set in LANGCHAIN_PROJECT.
+    
+    Initializes the QBOMState and executes the compiled `qbom_graph`
+    using the provided target (GitHub repository or website URL) and target type.
     """
     import os
     from langchain_core.runnables import RunnableConfig

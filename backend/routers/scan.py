@@ -114,6 +114,24 @@ async def _execute_scan(scan_id: str, req: ScanRequest):
             }
             await db.commit()
 
+            # Save individual findings to scan_findings table
+            from models.db import ScanFinding
+            for f in (scan.findings or []):
+                quantum_vulnerable = f.get("quantum_vulnerable", False)
+                if isinstance(quantum_vulnerable, str):
+                    quantum_vulnerable = quantum_vulnerable.lower() == "true"
+
+                finding = ScanFinding(
+                    scan_id=scan_id,
+                    algorithm=f.get("algorithm", "unknown"),
+                    location=f.get("location", "unknown"),
+                    hndl_score=float(f.get("hndl_score", 0.0)),
+                    is_shadow_crypto=bool(f.get("is_shadow_crypto", False)),
+                    quantum_vulnerable=bool(quantum_vulnerable),
+                )
+                db.add(finding)
+            await db.commit()
+
             # Record OTel metrics for the completed scan
             from observability.telemetry import record_scan_metrics
             record_scan_metrics(

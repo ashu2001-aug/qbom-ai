@@ -93,17 +93,21 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(rows))])
 
         elif name == "save_finding":
-            await db.execute(
-                text("""INSERT INTO scan_findings (scan_id, algorithm, location, hndl_score, is_shadow_crypto)
-                         VALUES (:sid, :algo, :loc, :score, :shadow)"""),
-                {
-                    "sid": arguments["scan_id"],
-                    "algo": arguments["algorithm"],
-                    "loc": arguments["location"],
-                    "score": arguments.get("hndl_score", 0.0),
-                    "shadow": arguments.get("is_shadow_crypto", False)
-                }
+            from uuid import uuid4
+            from models.db import ScanFinding
+            quantum_vulnerable = arguments["algorithm"] in {
+                "RSA", "ECC", "ECDSA", "ECDH", "DH", "DSA", "3DES", "RC4", "MD5", "SHA-1", "AES-128"
+            }
+            finding = ScanFinding(
+                id=str(uuid4()),
+                scan_id=arguments["scan_id"],
+                algorithm=arguments["algorithm"],
+                location=arguments["location"],
+                hndl_score=float(arguments.get("hndl_score", 0.0)),
+                is_shadow_crypto=bool(arguments.get("is_shadow_crypto", False)),
+                quantum_vulnerable=quantum_vulnerable
             )
+            db.add(finding)
             await db.commit()
             return CallToolResult(content=[TextContent(type="text", text='{"saved": true}')])
 

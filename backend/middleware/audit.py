@@ -56,20 +56,10 @@ class AuditMiddleware(BaseHTTPMiddleware):
 async def _write_audit_log(**kwargs) -> None:
     """Write a single audit log row. Swallows errors silently."""
     try:
-        import uuid
-        from models.db import AsyncSessionLocal
-        from sqlalchemy import text
+        from models.db import AsyncSessionLocal, AuditLog
 
         async with AsyncSessionLocal() as db:
-            await db.execute(
-                text("""
-                    INSERT INTO audit_log
-                        (id, api_key_hash, tier, method, path, status_code, duration_ms, ip_address, scan_id)
-                    VALUES
-                        (:id, :api_key_hash, :tier, :method, :path, :status_code, :duration_ms, :ip_address, :scan_id)
-                """),
-                {"id": None, **kwargs}
-            )
+            db.add(AuditLog(**kwargs))
             await db.commit()
     except Exception:
         pass  # Audit failures must never break the main request path

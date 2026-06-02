@@ -71,7 +71,13 @@ def generate_cyclonedx_bom(findings: list[dict], target: str, scan_id: str) -> d
                 "aggregate": "incomplete",
                 "assemblies": [f"crypto-{i}" for i in range(len(findings))]
             }
-        ]
+        ],
+        "qbomMeta": {
+            "avgHndlScore": round(avg_hndl, 2),
+            "maxHndlScore": round(max_hndl, 2),
+            "totalFindings": len(findings),
+            "quantumVulnerableCount": vuln_count,
+        }
     }
     return bom
 

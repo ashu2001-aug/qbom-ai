@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from langsmith import Client as LangSmithClient
 from langsmith.evaluation import evaluate
@@ -108,7 +108,7 @@ async def evaluate_with_ragas(
         return {
             "faithfulness": float(result["faithfulness"]),
             "answer_relevancy": float(result["answer_relevancy"]),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
         return {"error": str(e)}
@@ -184,5 +184,5 @@ async def run_continuous_eval(recent_scans: list[dict]) -> dict:
     return {
         "batch_size": len(recent_scans),
         "ragas": ragas_result,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }

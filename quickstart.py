@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 
 # ── Set env before ANY imports ────────────────────────────────────────────────
 os.environ.update({
+    "LLM_PROVIDER":              "azure",
     "DATABASE_URL":              "sqlite+aiosqlite:///./qbom_local.db",
     "AZURE_OPENAI_API_KEY":      "mock",
     "AZURE_OPENAI_ENDPOINT":     "https://mock.openai.azure.com/",
@@ -71,7 +72,7 @@ def ensure_deps():
 
 ensure_deps()
 
-# ── Stub heavy modules that aren't installed ──────────────────────────────────
+# ── Stub ONLY modules that aren't actually installed ──────────────────────────
 import types, numpy as np
 
 def _make_module(name):
@@ -79,13 +80,14 @@ def _make_module(name):
     sys.modules[name] = m
     return m
 
-# langchain stubs
-for mod_name in [
-    "langchain_core", "langchain_core.messages", "langchain_core.tools",
-    "langchain_core.runnables", "langchain_core.runnables.config",
-    "langchain", "langchain_openai", "langchain_community",
-    "langgraph", "langgraph.graph", "langgraph.prebuilt",
-    "langsmith",
+def _get_mod(name):
+    """Get module from sys.modules, or create a stub if missing."""
+    if name in sys.modules:
+        return sys.modules[name]
+    return _make_module(name)
+
+# Only stub modules whose root package is NOT installed
+_OPTIONAL_MODULES = [
     "pinecone", "sentence_transformers",
     "opentelemetry", "opentelemetry.sdk", "opentelemetry.sdk.trace",
     "opentelemetry.sdk.metrics", "opentelemetry.sdk.resources",
@@ -102,44 +104,18 @@ for mod_name in [
     "cyclonedx", "cyclonedx.model", "cyclonedx.model.bom",
     "cyclonedx.model.component", "cyclonedx.model.crypto",
     "cyclonedx.output", "cyclonedx.output.json",
-]:
-    if mod_name not in sys.modules:
-        _make_module(mod_name)
+]
+for mod_name in _OPTIONAL_MODULES:
+    root_pkg = mod_name.split(".")[0]
+    try:
+        __import__(root_pkg)
+    except Exception:
+        if mod_name not in sys.modules:
+            _make_module(mod_name)
 
-# Concrete stubs for things the code instantiates
-class _AIMessage:
-    def __init__(self, content="", tool_calls=None):
-        self.content = content
-        self.tool_calls = tool_calls or []
+# ── Mock LLM (use real langchain classes, fake responses only) ────────────────
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-class _HumanMessage:
-    def __init__(self, content=""): self.content = content
-
-class _SystemMessage:
-    def __init__(self, content=""): self.content = content
-
-class _ToolMessage:
-    def __init__(self, content="", tool_call_id=""): self.content = content; self.tool_call_id = tool_call_id
-
-# Patch message classes
-lc_msgs = sys.modules["langchain_core.messages"]
-lc_msgs.BaseMessage   = _AIMessage
-lc_msgs.AIMessage     = _AIMessage
-lc_msgs.HumanMessage  = _HumanMessage
-lc_msgs.SystemMessage = _SystemMessage
-lc_msgs.ToolMessage   = _ToolMessage
-
-# Mock tool decorator
-def _tool(fn=None, **kw):
-    if fn: fn.invoke = lambda args: fn(**args) if isinstance(args,dict) else fn(args); return fn
-    return _tool
-sys.modules["langchain_core.tools"].tool = _tool
-
-# Mock RunnableConfig
-class _RunnableConfig(dict): pass
-sys.modules["langchain_core.runnables"].RunnableConfig = _RunnableConfig
-
-# Mock AzureChatOpenAI
 _RESPONSES = [
     "scanner",
     json.dumps([{
@@ -161,65 +137,29 @@ _RESPONSES = [
 _n = [0]
 
 class _MockLLM:
+    """Drop-in replacement for AzureChatOpenAI that returns canned responses."""
     def bind_tools(self, tools): return self
     async def ainvoke(self, messages, **kw):
         r = _RESPONSES[_n[0] % len(_RESPONSES)]; _n[0] += 1
-        return _AIMessage(r)
+        msg = AIMessage(content=r); msg.tool_calls = []; return msg
     def invoke(self, messages, **kw):
         r = _RESPONSES[_n[0] % len(_RESPONSES)]; _n[0] += 1
-        return _AIMessage(r)
+        msg = AIMessage(content=r); msg.tool_calls = []; return msg
 
-sys.modules["langchain_openai"].AzureChatOpenAI = lambda **kw: _MockLLM()
+# Patch AzureChatOpenAI to return our mock LLM
+import langchain_openai
+langchain_openai.AzureChatOpenAI = lambda **kw: _MockLLM()
 
-# Mock LangGraph
-import operator
-from typing import Annotated, Sequence, Any
+# Patch langsmith traceable to be a no-op decorator (avoid tracing calls)
+import langsmith
+langsmith.traceable = lambda *a, **kw: (lambda fn: fn)
+langsmith.Client = lambda **kw: MagicMock()
 
-class _StateGraph:
-    def __init__(self, state_type): self._nodes = {}; self._edges = []; self._entry = None; self._cond = {}
-    def add_node(self, name, fn): self._nodes[name] = fn
-    def add_edge(self, a, b): self._edges.append((a,b))
-    def add_conditional_edges(self, src, fn, *a): self._cond[src] = fn
-    def set_entry_point(self, name): self._entry = name
-    def compile(self): return _CompiledGraph(self)
-
-END = "__end__"
-
-class _CompiledGraph:
-    def __init__(self, g): self._g = g
-    async def ainvoke(self, state, config=None):
-        # Simple linear mock execution: supervisor→scanner→enricher→reflector→reporter
-        g = self._g
-        current = g._entry
-        visited = set()
-        while current and current != END and current not in visited:
-            visited.add(current)
-            fn = g._nodes.get(current)
-            if fn:
-                result = await fn(state)
-                if result: state = result
-            # routing
-            if current in g._cond:
-                nxt = g._cond[current](state)
-                current = nxt if nxt != END else None
-            else:
-                # find edge
-                nxt = next((b for a,b in g._g._edges if a == current), None)
-                current = nxt
-        return state
-
-lg = sys.modules["langgraph.graph"]
-lg.StateGraph = _StateGraph
-lg.END = END
-
-# Mock langgraph.prebuilt
-class _ToolNode:
-    def __init__(self, tools): self.tools = {t.name: t for t in tools if hasattr(t,'name')}
-sys.modules["langgraph.prebuilt"].ToolNode = _ToolNode
-
-# Mock langsmith traceable
-sys.modules["langsmith"].traceable = lambda *a, **kw: (lambda fn: fn)
-sys.modules["langsmith"].Client    = lambda **kw: MagicMock()
+# Helper: get module from sys.modules or create a stub
+def _get_mod(name):
+    if name in sys.modules:
+        return sys.modules[name]
+    return _make_module(name)
 
 # Mock Pinecone
 class _PineconeIndex:
@@ -238,54 +178,54 @@ class _Pinecone:
     def Index(self, name): return self._idx
     def list_indexes(self): return [type("I",(),{"name":"qbom-local"})()]
 
-sys.modules["pinecone"].Pinecone = _Pinecone
+_get_mod("pinecone").Pinecone = _Pinecone
 
 # Mock sentence_transformers
 class _SentenceTransformer:
     def __init__(self, *a, **kw): pass
     def encode(self, text, **kw): return np.random.rand(384).astype("float32")
-sys.modules["sentence_transformers"].SentenceTransformer = _SentenceTransformer
+_get_mod("sentence_transformers").SentenceTransformer = _SentenceTransformer
 
 # Mock OpenTelemetry (no-ops)
 for attr in ["trace","metrics"]:
-    m = _make_module(f"opentelemetry.{attr}")
+    m = _get_mod(f"opentelemetry.{attr}")
     setattr(m, "get_tracer", lambda *a,**k: MagicMock())
     setattr(m, "get_meter",  lambda *a,**k: MagicMock())
     setattr(m, "set_tracer_provider", lambda *a,**k: None)
     setattr(m, "set_meter_provider",  lambda *a,**k: None)
-sys.modules["opentelemetry.instrumentation.fastapi"].FastAPIInstrumentor = MagicMock()
-sys.modules["opentelemetry.instrumentation.sqlalchemy"].SQLAlchemyInstrumentor = MagicMock()
-sys.modules["opentelemetry.instrumentation.httpx"].HTTPXClientInstrumentor = MagicMock()
+_get_mod("opentelemetry.instrumentation.fastapi").FastAPIInstrumentor = MagicMock()
+_get_mod("opentelemetry.instrumentation.sqlalchemy").SQLAlchemyInstrumentor = MagicMock()
+_get_mod("opentelemetry.instrumentation.httpx").HTTPXClientInstrumentor = MagicMock()
 
 # Mock MCP
-sys.modules["mcp.server"].Server = MagicMock
-sys.modules["mcp.server.models"].InitializationOptions = MagicMock
-sys.modules["mcp.types"].Tool = MagicMock
-sys.modules["mcp.types"].TextContent = MagicMock
-sys.modules["mcp.types"].CallToolResult = MagicMock
-sys.modules["mcp.server.stdio"].stdio_server = MagicMock()
+_get_mod("mcp.server").Server = MagicMock
+_get_mod("mcp.server.models").InitializationOptions = MagicMock
+_get_mod("mcp.types").Tool = MagicMock
+_get_mod("mcp.types").TextContent = MagicMock
+_get_mod("mcp.types").CallToolResult = MagicMock
+_get_mod("mcp.server.stdio").stdio_server = MagicMock()
 
 # Mock CycloneDX
-sys.modules["cyclonedx.model.bom"].Bom = MagicMock
-sys.modules["cyclonedx.model.component"].Component = MagicMock
-sys.modules["cyclonedx.model.component"].ComponentType = MagicMock()
-sys.modules["cyclonedx.model.crypto"].CryptoProperties = MagicMock
-sys.modules["cyclonedx.model.crypto"].CryptoAlgorithmProperties = MagicMock
-sys.modules["cyclonedx.model.crypto"].CryptoPrimitive = type("CP",(),{
+_get_mod("cyclonedx.model.bom").Bom = MagicMock
+_get_mod("cyclonedx.model.component").Component = MagicMock
+_get_mod("cyclonedx.model.component").ComponentType = MagicMock()
+_get_mod("cyclonedx.model.crypto").CryptoProperties = MagicMock
+_get_mod("cyclonedx.model.crypto").CryptoAlgorithmProperties = MagicMock
+_get_mod("cyclonedx.model.crypto").CryptoPrimitive = type("CP",(),{
     "PKE":"pke","BLOCK_CIPHER":"blockCipher","HASH":"hash","UNKNOWN":"unknown"
 })()
-sys.modules["cyclonedx.model.crypto"].CryptoAlgorithmMode = MagicMock()
-sys.modules["cyclonedx.output.json"].JsonV1Dot7 = MagicMock
+_get_mod("cyclonedx.model.crypto").CryptoAlgorithmMode = MagicMock()
+_get_mod("cyclonedx.output.json").JsonV1Dot7 = MagicMock
 
 # Mock Azure identity
-sys.modules["azure.identity"].DefaultAzureCredential = MagicMock
+_get_mod("azure.identity").DefaultAzureCredential = MagicMock
 
 # Mock DeepEval / RAGAS
-sys.modules["deepeval"].evaluate = MagicMock(return_value=MagicMock())
-sys.modules["ragas"].evaluate = MagicMock(return_value={"faithfulness":0.91,"answer_relevancy":0.87})
+_get_mod("deepeval").evaluate = MagicMock(return_value=MagicMock())
+_get_mod("ragas").evaluate = MagicMock(return_value={"faithfulness":0.91,"answer_relevancy":0.87})
 
 # Mock datasets
-sys.modules["datasets"].Dataset = MagicMock
+_get_mod("datasets").Dataset = MagicMock
 
 print("✓ All heavy dependencies mocked")
 

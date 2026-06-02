@@ -98,13 +98,14 @@ async def _run_codeql_scan(repo_path: str) -> list[dict]:
             "--overwrite"
         ], capture_output=True, timeout=120)
 
+        sarif_file = Path(repo_path) / "qbom_codeql.sarif"
         result = await asyncio.to_thread(subprocess.run, [
             "codeql", "database", "analyze", db_path,
             "python-security-experimental.qls",
-            "--format=sarif-latest", "--output=/tmp/qbom_codeql.sarif"
+            "--format=sarif-latest", f"--output={sarif_file}"
         ], capture_output=True, timeout=180)
 
-        return _parse_sarif("/tmp/qbom_codeql.sarif")
+        return _parse_sarif(str(sarif_file))
     except Exception:
         return []   # CodeQL not installed — graceful degradation
 

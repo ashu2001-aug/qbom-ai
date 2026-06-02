@@ -32,7 +32,7 @@ CNSA2_RULES = {
     "AES-128":{"allowed_until": 2030, "replacement": "AES-256",    "standard": "FIPS 197"},
 }
 
-CURRENT_YEAR = 2025
+CURRENT_YEAR = 2026
 
 
 class HndlScoreRequest(BaseModel):

@@ -61,7 +61,7 @@ def setup_telemetry(app) -> None:
             tracer_provider.add_span_processor(
                 BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint))
             )
-            log.info(f"OTel traces → {otlp_endpoint}")
+            log.info(f"OTel traces -> {otlp_endpoint}")
         except Exception as e:
             log.warning(f"OTLP exporter setup failed: {e}")
 

@@ -84,6 +84,6 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         start = time.time()
         response = await call_next(request)
         duration_ms = round((time.time() - start) * 1000, 1)
-        print(f"[{request.method}] {request.url.path} → {response.status_code} ({duration_ms}ms)")
+        print(f"[{request.method}] {request.url.path} -> {response.status_code} ({duration_ms}ms)")
         response.headers["X-Response-Time"] = f"{duration_ms}ms"
         return response

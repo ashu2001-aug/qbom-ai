@@ -9,7 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Set env vars BEFORE any app module is imported
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://qbom:qbom_dev_password@localhost:5432/qbom_test")
 os.environ.setdefault("AZURE_OPENAI_API_KEY", "test-key-not-real")
+os.environ.setdefault("OPENAI_API_KEY", "test-key-not-real")
 os.environ.setdefault("AZURE_OPENAI_ENDPOINT", "https://test.openai.azure.com/")
+
 os.environ.setdefault("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 os.environ.setdefault("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
 os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
@@ -72,7 +74,7 @@ def mock_pinecone():
     mock_pc.Index.return_value = mock_idx
     mock_pc.list_indexes.return_value = [MagicMock(name="qbom-test-index")]
 
-    with patch("services.hybrid_retrieval.Pinecone", return_value=mock_pc), \
+    with patch("pinecone.Pinecone", return_value=mock_pc), \
          patch("services.hybrid_retrieval.get_pinecone_index", return_value=mock_idx):
         yield mock_pc
 
